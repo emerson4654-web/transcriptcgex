@@ -1,412 +1,589 @@
-const express = require("express");
-const fs = require("node:fs");
-const path = require("node:path");
-const crypto = require("node:crypto");
+import express from "express";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
+const PORT = Number(process.env.PORT || 10000);
 
-const PORT = process.env.PORT || 10000;
-const API_KEY = process.env.TRANSCRIPT_API_KEY || "";
+// Diretório onde os transcripts serão armazenados
+const TRANSCRIPTS_DIR = path.join(__dirname, "website", "transcripts");
 
-const transcriptsPath = path.join(
-  __dirname,
-  "website",
-  "transcripts"
-);
-
-fs.mkdirSync(transcriptsPath, { recursive: true });
+if (!fs.existsSync(TRANSCRIPTS_DIR)) {
+  fs.mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+}
 
 app.use(express.json({ limit: "2mb" }));
 
-// ==============================
-// FUNÇÕES AUXILIARES
-// ==============================
+// Permite requisições do BDFD sem exigir senha
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
 
-function escapeHTML(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-function checkKey(req, res, next) {
-  if (!API_KEY) {
-    return res.status(500).json({
-      error: "TRANSCRIPT_API_KEY não configurada."
-    });
-  }
-
-  const receivedKey =
-    req.query.key || req.headers["x-api-key"];
-
-  if (receivedKey !== API_KEY) {
-    return res.status(401).json({
-      error: "Chave de API inválida."
-    });
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
   }
 
   next();
+});
+
+// Arquivos públicos do site
+const publicDir = path.join(__dirname, "public");
+
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir));
 }
 
-function readTranscript(id) {
-  const filePath = path.join(
-    transcriptsPath,
-    `${id}.json`
-  );
+// ================================
+// FUNÇÕES AUXILIARES
+// ================================
 
-  if (!fs.existsSync(filePath)) {
-    return null;
-  }
+function getTranscriptPath(id) {
+  return path.join(TRANSCRIPTS_DIR, `${id}.json`);
+}
 
-  return JSON.parse(
-    fs.readFileSync(filePath, "utf8")
-  );
+function generateTranscriptId() {
+  return crypto.randomUUID();
 }
 
 function saveTranscript(transcript) {
+  const filePath = getTranscriptPath(transcript.id);
+
   fs.writeFileSync(
-    path.join(
-      transcriptsPath,
-      `${transcript.id}.json`
-    ),
+    filePath,
     JSON.stringify(transcript, null, 2),
     "utf8"
   );
 }
 
-// ==============================
-// PÁGINA INICIAL
-// ==============================
+function loadTranscript(id) {
+  const filePath = getTranscriptPath(id);
 
-app.get("/", (req, res) => {
-  res.send(`
-    <h1>TranscriptCGEx</h1>
-    <p>O site está online.</p>
-  `);
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (error) {
+    console.error("Erro ao ler transcript:", error);
+    return null;
+  }
+}
+
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function getTranscriptURL(req, id) {
+  const baseURL = `${req.protocol}://${req.get("host")}`;
+  return `${baseURL}/transcript/${encodeURIComponent(id)}`;
+}
+
+function normalizeMessage(message) {
+  const author = message.author || {};
+
+  return {
+    id: String(message.id || crypto.randomUUID()),
+    author: {
+      id: String(author.id || message.authorId || "desconhecido"),
+      username: String(
+        author.username ||
+        message.username ||
+        message.authorName ||
+        "Usuário desconhecido"
+      )
+    },
+    content: String(message.content || ""),
+    attachments: Array.isArray(message.attachments)
+      ? message.attachments.map((attachment) => ({
+          name: String(attachment.name || "arquivo"),
+          url: String(attachment.url || "")
+        }))
+      : [],
+    timestamp: message.timestamp || new Date().toISOString()
+  };
+}
+
+// ================================
+// STATUS DA API
+// ================================
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "TranscriptCGEx",
+    apiKeyRequired: false,
+    message: "TranscriptCGEx online."
+  });
 });
 
-// ==============================
+// ================================
 // CRIAR TRANSCRIPT
-// ==============================
+// ================================
 
-app.post(
-  "/api/transcripts",
-  checkKey,
-  (req, res) => {
-    const id = crypto.randomUUID();
+app.post("/api/transcripts", (req, res) => {
+  try {
+    const body = req.body || {};
+
+    const id = generateTranscriptId();
 
     const transcript = {
       id,
-      channelName:
-        req.body.channelName || "ticket",
-      guildName:
-        req.body.guildName || "Servidor",
-      createdAt:
-        new Date().toISOString(),
+      title: String(body.title || "Transcript de Ticket"),
+      channelId: String(body.channelId || ""),
+      channelName: String(body.channelName || "ticket"),
+      guildId: String(body.guildId || ""),
+      guildName: String(body.guildName || "Servidor"),
+      creatorId: String(body.creatorId || ""),
+      creatorName: String(body.creatorName || ""),
+      status: "open",
+      createdAt: new Date().toISOString(),
       closedAt: null,
+      closedBy: null,
       messages: []
     };
 
     saveTranscript(transcript);
 
-    const baseUrl =
-      `${req.protocol}://${req.get("host")}`;
+    res.status(201).json({
+      ok: true,
+      message: "Transcript criado com sucesso.",
+      id: transcript.id,
+      url: getTranscriptURL(req, transcript.id),
+      transcript
+    });
+  } catch (error) {
+    console.error("Erro ao criar transcript:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: "Não foi possível criar o transcript."
+    });
+  }
+});
+
+// ================================
+// ADICIONAR MENSAGEM
+// ================================
+
+app.post("/api/transcripts/:id/messages", (req, res) => {
+  try {
+    const transcript = loadTranscript(req.params.id);
+
+    if (!transcript) {
+      return res.status(404).json({
+        ok: false,
+        error: "Transcript não encontrado."
+      });
+    }
+
+    if (transcript.status === "closed") {
+      return res.status(400).json({
+        ok: false,
+        error: "Este transcript já está fechado."
+      });
+    }
+
+    const message = normalizeMessage(req.body || {});
+
+    if (!message.content && message.attachments.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "A mensagem precisa conter texto ou anexo."
+      });
+    }
+
+    transcript.messages.push(message);
+
+    saveTranscript(transcript);
 
     res.status(201).json({
-      success: true,
-      id,
-      url: `${baseUrl}/transcript/${id}`
+      ok: true,
+      message: "Mensagem registrada.",
+      transcriptId: transcript.id,
+      registeredMessage: message
+    });
+  } catch (error) {
+    console.error("Erro ao registrar mensagem:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: "Não foi possível registrar a mensagem."
     });
   }
-);
+});
 
-// ==============================
-// ADICIONAR MENSAGEM
-// ==============================
-
-app.post(
-  "/api/transcripts/:id/messages",
-  checkKey,
-  (req, res) => {
-    const transcript =
-      readTranscript(req.params.id);
-
-    if (!transcript) {
-      return res.status(404).json({
-        error: "Transcript não encontrado."
-      });
-    }
-
-    if (transcript.closedAt) {
-      return res.status(409).json({
-        error: "Transcript já fechado."
-      });
-    }
-
-    const message = req.body;
-
-    if (!message.author) {
-      return res.status(400).json({
-        error: "O campo author é obrigatório."
-      });
-    }
-
-    if (
-      !message.content &&
-      !Array.isArray(message.attachments)
-    ) {
-      return res.status(400).json({
-        error: "Envie content ou attachments."
-      });
-    }
-
-    transcript.messages.push({
-      author: String(message.author),
-      content: String(
-        message.content || ""
-      ),
-      timestamp:
-        message.timestamp ||
-        new Date().toISOString(),
-      attachments:
-        Array.isArray(message.attachments)
-          ? message.attachments
-          : []
-    });
-
-    saveTranscript(transcript);
-
-    res.json({
-      success: true,
-      totalMessages:
-        transcript.messages.length
-    });
-  }
-);
-
-// ==============================
+// ================================
 // FECHAR TRANSCRIPT
-// ==============================
+// ================================
 
-app.post(
-  "/api/transcripts/:id/close",
-  checkKey,
-  (req, res) => {
-    const transcript =
-      readTranscript(req.params.id);
+app.post("/api/transcripts/:id/close", (req, res) => {
+  try {
+    const transcript = loadTranscript(req.params.id);
 
     if (!transcript) {
       return res.status(404).json({
+        ok: false,
         error: "Transcript não encontrado."
       });
     }
 
-    transcript.closedAt =
-      new Date().toISOString();
+    if (transcript.status === "closed") {
+      return res.json({
+        ok: true,
+        message: "Transcript já estava fechado.",
+        id: transcript.id,
+        url: getTranscriptURL(req, transcript.id),
+        transcript
+      });
+    }
+
+    transcript.status = "closed";
+    transcript.closedAt = new Date().toISOString();
+    transcript.closedBy = String(
+      req.body?.closedBy ||
+      req.body?.closedByName ||
+      "Sistema"
+    );
 
     saveTranscript(transcript);
 
-    const baseUrl =
-      `${req.protocol}://${req.get("host")}`;
-
     res.json({
-      success: true,
-      url:
-        `${baseUrl}/transcript/${transcript.id}`
+      ok: true,
+      message: "Transcript fechado com sucesso.",
+      id: transcript.id,
+      url: getTranscriptURL(req, transcript.id),
+      transcript
+    });
+  } catch (error) {
+    console.error("Erro ao fechar transcript:", error);
+
+    res.status(500).json({
+      ok: false,
+      error: "Não foi possível fechar o transcript."
     });
   }
-);
+});
 
-// ==============================
-// VISUALIZAR TRANSCRIPT
-// ==============================
+// ================================
+// CONSULTAR DADOS DO TRANSCRIPT
+// ================================
 
-app.get(
-  "/transcript/:id",
-  (req, res) => {
-    const id = req.params.id;
+app.get("/api/transcripts/:id", (req, res) => {
+  const transcript = loadTranscript(req.params.id);
 
-    if (
-      !/^[0-9a-f-]{36}$/i.test(id)
-    ) {
-      return res.status(400).send(
-        "ID inválido."
-      );
-    }
+  if (!transcript) {
+    return res.status(404).json({
+      ok: false,
+      error: "Transcript não encontrado."
+    });
+  }
 
-    const transcript =
-      readTranscript(id);
+  res.json({
+    ok: true,
+    transcript
+  });
+});
 
-    if (!transcript) {
-      return res.status(404).send(
-        "Transcript não encontrado."
-      );
-    }
+// ================================
+// PÁGINA HTML DO TRANSCRIPT
+// ================================
 
-    const messagesHTML =
-      transcript.messages.map(
-        (message) => {
-          const attachments =
-            (message.attachments || [])
-              .map(
-                (attachment) => `
-                  <a
-                    href="${escapeHTML(attachment.url)}"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    ${escapeHTML(
-                      attachment.name || "Anexo"
-                    )}
-                  </a>
-                `
-              )
-              .join("<br>");
+app.get("/transcript/:id", (req, res) => {
+  const transcript = loadTranscript(req.params.id);
 
-          return `
-            <article class="message">
-              <div class="author">
-                ${escapeHTML(
-                  message.author
-                )}
-
-                <span>
-                  ${escapeHTML(
-                    message.timestamp
-                  )}
-                </span>
-              </div>
-
-              <div class="content">
-                ${escapeHTML(
-                  message.content
-                )}
-              </div>
-
-              ${attachments}
-            </article>
-          `;
-        }
-      ).join("");
-
-    res.send(`
+  if (!transcript) {
+    return res.status(404).send(`
       <!DOCTYPE html>
       <html lang="pt-BR">
+        <head>
+          <meta charset="UTF-8">
+          <title>Transcript não encontrado</title>
+        </head>
+        <body>
+          <h1>Transcript não encontrado</h1>
+          <p>O transcript solicitado não existe.</p>
+        </body>
+      </html>
+    `);
+  }
 
+  const messagesHTML = transcript.messages.length
+    ? transcript.messages.map((message) => {
+        const authorName = escapeHTML(message.author.username);
+        const authorId = escapeHTML(message.author.id);
+        const content = escapeHTML(message.content);
+        const timestamp = escapeHTML(
+          new Date(message.timestamp).toLocaleString("pt-BR")
+        );
+
+        const attachmentsHTML = message.attachments
+          .filter((attachment) => attachment.url)
+          .map((attachment) => `
+            <div class="attachment">
+              📎
+              <a
+                href="${escapeHTML(attachment.url)}"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                ${escapeHTML(attachment.name)}
+              </a>
+            </div>
+          `)
+          .join("");
+
+        return `
+          <article class="message">
+            <div class="message-header">
+              <strong>${authorName}</strong>
+              <span class="author-id">ID: ${authorId}</span>
+              <time>${timestamp}</time>
+            </div>
+
+            <div class="message-content">
+              ${content.replace(/\n/g, "<br>")}
+            </div>
+
+            ${attachmentsHTML}
+          </article>
+        `;
+      }).join("")
+    : `
+      <div class="empty">
+        Nenhuma mensagem foi registrada neste transcript.
+      </div>
+    `;
+
+  const statusLabel = transcript.status === "closed"
+    ? "Fechado"
+    : "Aberto";
+
+  const closedInfo = transcript.closedAt
+    ? `
+      <p>
+        <strong>Fechado em:</strong>
+        ${escapeHTML(new Date(transcript.closedAt).toLocaleString("pt-BR"))}
+      </p>
+      <p>
+        <strong>Fechado por:</strong>
+        ${escapeHTML(transcript.closedBy || "Sistema")}
+      </p>
+    `
+    : "";
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="pt-BR">
       <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1.0"
-        >
-
-        <title>TranscriptCGEx</title>
+        <title>${escapeHTML(transcript.title)}</title>
 
         <style>
+          * {
+            box-sizing: border-box;
+          }
+
           body {
             margin: 0;
-            background: #0f172a;
-            color: #f8fafc;
-            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #111827;
+            color: #f9fafb;
+            font-family: Arial, Helvetica, sans-serif;
           }
 
           .container {
-            max-width: 900px;
-            margin: 30px auto;
-            padding: 20px;
+            max-width: 1000px;
+            margin: 0 auto;
           }
 
-          .header,
-          .message {
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 18px;
-            margin-bottom: 12px;
+          .header {
+            padding: 24px;
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 16px;
+            margin-bottom: 20px;
           }
 
-          .author {
-            color: #60a5fa;
-            font-weight: bold;
-          }
-
-          .author span {
-            color: #94a3b8;
-            font-size: 12px;
-            font-weight: normal;
-            margin-left: 8px;
-          }
-
-          .content {
-            margin-top: 10px;
-            white-space: pre-wrap;
+          h1 {
+            margin: 0 0 12px;
+            font-size: 26px;
             overflow-wrap: anywhere;
           }
 
-          a {
+          .info {
+            color: #d1d5db;
+            line-height: 1.6;
+          }
+
+          .status {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: ${
+              transcript.status === "closed"
+                ? "#991b1b"
+                : "#166534"
+            };
+            color: #fff;
+            font-size: 13px;
+            font-weight: bold;
+          }
+
+          .message {
+            background: #1f2937;
+            border: 1px solid #374151;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 12px;
+          }
+
+          .message-header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+          }
+
+          .message-header strong {
             color: #93c5fd;
+          }
+
+          .author-id {
+            color: #9ca3af;
+            font-size: 12px;
+          }
+
+          time {
+            color: #9ca3af;
+            font-size: 12px;
+            margin-left: auto;
+          }
+
+          .message-content {
+            white-space: normal;
+            overflow-wrap: anywhere;
+            color: #f3f4f6;
+            line-height: 1.6;
+          }
+
+          .attachment {
+            margin-top: 10px;
+            padding: 8px;
+            background: #111827;
+            border-radius: 8px;
+          }
+
+          a {
+            color: #60a5fa;
+          }
+
+          .empty {
+            background: #1f2937;
+            border-radius: 12px;
+            padding: 24px;
+            color: #d1d5db;
+            text-align: center;
+          }
+
+          .footer {
+            margin-top: 20px;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 12px;
+          }
+
+          @media (max-width: 600px) {
+            body {
+              padding: 10px;
+            }
+
+            .header {
+              padding: 18px;
+            }
+
+            time {
+              width: 100%;
+              margin-left: 0;
+            }
           }
         </style>
       </head>
 
       <body>
         <main class="container">
-
           <section class="header">
-            <h1>📁 TranscriptCGEx</h1>
+            <h1>📄 ${escapeHTML(transcript.title)}</h1>
 
-            <p>
-              Ticket:
-              ${escapeHTML(
-                transcript.channelName
-              )}
-            </p>
+            <span class="status">${statusLabel}</span>
 
-            <p>
-              Servidor:
-              ${escapeHTML(
-                transcript.guildName
-              )}
-            </p>
+            <div class="info">
+              <p>
+                <strong>Servidor:</strong>
+                ${escapeHTML(transcript.guildName)}
+              </p>
 
-            <p>
-              Criado em:
-              ${escapeHTML(
-                transcript.createdAt
-              )}
-            </p>
+              <p>
+                <strong>Canal:</strong>
+                ${escapeHTML(transcript.channelName)}
+              </p>
 
-            <p>
-              Fechado em:
-              ${escapeHTML(
-                transcript.closedAt ||
-                "Ainda aberto"
-              )}
-            </p>
+              <p>
+                <strong>Criado em:</strong>
+                ${escapeHTML(new Date(transcript.createdAt).toLocaleString("pt-BR"))}
+              </p>
+
+              ${closedInfo}
+            </div>
           </section>
 
-          ${
-            messagesHTML ||
-            "<p>Nenhuma mensagem registrada.</p>"
-          }
+          <section>
+            ${messagesHTML}
+          </section>
 
+          <footer class="footer">
+            TranscriptCGEx • Sistema de registros do Emerson
+          </footer>
         </main>
       </body>
+    </html>
+  `;
 
-      </html>
-    `);
-  }
-);
+  res.type("html").send(html);
+});
 
-// ==============================
+// ================================
+// TRATAMENTO DE ERROS
+// ================================
+
+app.use((error, _req, res, _next) => {
+  console.error("Erro interno:", error);
+
+  res.status(500).json({
+    ok: false,
+    error: "Erro interno do servidor."
+  });
+});
+
+// ================================
 // INICIAR SERVIDOR
-// ==============================
+// ================================
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `TranscriptCGEx rodando na porta ${PORT}`
-  );
+  console.log(`TranscriptCGEx rodando na porta ${PORT}`);
 });
 
