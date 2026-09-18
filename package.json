@@ -1,0 +1,12 @@
+{
+  "name": "transcriptcgex",
+  "version": "1.0.0",
+  "description": "Site de transcripts para tickets do Discord",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
